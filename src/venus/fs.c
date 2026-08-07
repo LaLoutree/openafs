@@ -45,6 +45,14 @@
 #define MAXINSIZE 1300		/* pioctl complains if data is larger than this */
 #define VMSGSIZE 128		/* size of msg buf in volume hdr */
 
+#ifndef MAXSYMLINKS
+# ifdef SYMLOOP_MAX
+#  define MAXSYMLINKS SYMLOOP_MAX
+# else
+#  define MAXSYMLINKS 32
+# endif
+#endif
+
 static char space[AFS_PIOCTL_MAXSIZE];
 static char tspace[1024];
 static struct ubik_client *uclient;
@@ -1642,6 +1650,281 @@ out:
     return -1;
 }
 
+static void
+StripLastComponent(char *path)
+{
+    char *lastSlash = strrchr(path, '/');
+
+    if (lastSlash == path) {
+	path[1] = '\0';
+    } else {
+	*lastSlash = '\0';
+    }
+}
+
+static int
+DescribeEntry(char *path, int verbose, int hops)
+{
+    char *target = NULL;
+    char *prefix = NULL;
+    char *parent_dir = NULL;
+    char *last_component = NULL;
+    struct stat s;
+    int code = -1;
+
+    target = malloc(MAXPATHLEN);
+    prefix = malloc(MAXPATHLEN);
+    if (target == NULL || prefix == NULL) {
+	fprintf(stderr, "%s: Error allocating memory\n", pn);
+	goto out;
+    }
+
+    while (hops <= MAXSYMLINKS) {
+	if (lstat(path, &s) < 0) {
+	    if (errno == ENOENT) {
+		printf("'%s' does not exist\n", path);
+	    } else {
+		printf("'%s': lstat failed\n", path);
+	    }
+	    goto out;
+	}
+
+	if (GetLastComponent(path, &parent_dir, &last_component, NULL, 1) != 0) {
+	    printf("'%s' cannot be described\n", path);
+	    goto out;
+	}
+
+	if (S_ISLNK(s.st_mode)) {
+	    const char *rest, *slash;
+	    char *src, *dst;
+	    ssize_t len;
+	    int n;
+
+	    len = readlink(path, target, MAXPATHLEN - 1);
+	    if (len < 0) {
+		printf("'%s' is a symbolic link, but its target cannot be "
+		       "read\n",
+		       path);
+		goto out;
+	    }
+	    target[len] = '\0';
+
+	    printf("'%s' is a symbolic link, leading to ", path);
+
+	    if (target[0] == '/') {
+		n = snprintf(path, MAXPATHLEN, "%s", target);
+	    } else {
+		for (rest = target;;) {
+		    while (rest[0] == '/') {
+			rest++;
+		    }
+
+		    if (rest[0] == '.' && (rest[1] == '/' || rest[1] == '\0')) {
+			rest += 1;
+		    } else if (rest[0] == '.' && rest[1] == '.' &&
+			       (rest[2] == '/' || rest[2] == '\0')) {
+			StripLastComponent(parent_dir);
+			rest += 2;
+		    } else {
+			break;
+		    }
+		}
+
+		if (rest[0] == '\0') {
+		    n = snprintf(path, MAXPATHLEN, "%s", parent_dir);
+		} else {
+		    n = snprintf(path, MAXPATHLEN, "%s%s%s", parent_dir,
+				 (strcmp(parent_dir, "/") == 0) ? "" : "/",
+				 rest);
+		}
+	    }
+
+	    if (n < 0 || n >= MAXPATHLEN) {
+		printf("a path that is too long\n");
+		goto out;
+	    }
+
+	    for (src = dst = path; *src != '\0'; src++) {
+		if (*src != '/' || dst == path || dst[-1] != '/') {
+		    *dst++ = *src;
+		}
+	    }
+	    while (dst > path + 1 && dst[-1] == '/') {
+		dst--;
+	    }
+	    *dst = '\0';
+
+	    printf("'%s'\n", path);
+	    hops++;
+
+	    if (verbose) {
+		printf("\n");
+
+		for (slash = strchr(path + 1, '/');
+		     slash != NULL && slash[1] != '\0';
+		     slash = strchr(slash + 1, '/')) {
+		    snprintf(prefix, MAXPATHLEN, "%.*s", (int)(slash - path),
+			     path);
+		    if (DescribeEntry(prefix, 0, hops) != 0) {
+			goto out;
+		    }
+		}
+	    }
+
+	    free(parent_dir);
+	    parent_dir = NULL;
+	    free(last_component);
+	    last_component = NULL;
+	    continue;
+	}
+
+	if (S_ISDIR(s.st_mode)) {
+	    struct ViceIoctl blob;
+
+	    blob.in = last_component;
+	    blob.in_size = strlen(last_component) + 1;
+	    blob.out_size = AFS_PIOCTL_MAXSIZE;
+	    blob.out = space;
+	    memset(space, 0, AFS_PIOCTL_MAXSIZE);
+
+	    if (pioctl(parent_dir, VIOC_AFS_STAT_MT_PT, &blob, 1) == 0) {
+		printf("'%s' is a mount point, for volume '%s'\n", path, space);
+	    } else {
+		printf("'%s' is a directory\n", path);
+	    }
+	} else if (S_ISREG(s.st_mode)) {
+	    printf("'%s' is a regular file\n", path);
+	} else {
+	    printf("'%s' is a special file\n", path);
+	}
+
+	code = 0;
+	goto out;
+    }
+
+    printf("too many levels of symbolic links\n");
+
+out:
+    free(target);
+    free(prefix);
+    free(parent_dir);
+    free(last_component);
+
+    return code;
+}
+
+static int
+WalkPath(const char *data, int verbose)
+{
+    char *path = NULL;
+    char *rest = NULL;
+    char *last = NULL;
+    char *cwd = NULL;
+    char *comp = NULL;
+    int code = -1;
+    int n;
+
+    path = malloc(MAXPATHLEN);
+    rest = malloc(MAXPATHLEN);
+    last = malloc(MAXPATHLEN);
+    cwd = malloc(MAXPATHLEN);
+    if (path == NULL || rest == NULL || last == NULL || cwd == NULL) {
+	fprintf(stderr, "%s: Error allocating memory\n", pn);
+	goto out;
+    }
+
+    if (data[0] != '/' && getcwd(cwd, MAXPATHLEN) == NULL) {
+	fprintf(stderr, "%s: Can't get current directory\n", pn);
+	goto out;
+    }
+
+    if (data[0] != '/' && verbose) {
+	n = snprintf(rest, MAXPATHLEN, "%s/%s", cwd, data);
+    } else {
+	n = snprintf(rest, MAXPATHLEN, "%s", data);
+    }
+
+    if (n < 0 || n >= MAXPATHLEN) {
+	fprintf(stderr, "%s: path too long: '%s'\n", pn, data);
+	goto out;
+    }
+
+    last[0] = '\0';
+    if (data[0] == '/' || verbose) {
+	strcpy(path, "/");
+    } else {
+	strcpy(path, cwd);
+    }
+
+    for (comp = strtok(rest, "/"); comp != NULL; comp = strtok(NULL, "/")) {
+	if (strcmp(comp, ".") == 0) {
+	    continue;
+	}
+
+	if (strcmp(comp, "..") == 0) {
+	    StripLastComponent(path);
+	    continue;
+	}
+
+	if (strcmp(path, "/") != 0) {
+	    strlcat(path, "/", MAXPATHLEN);
+	}
+	if (strlcat(path, comp, MAXPATHLEN) >= MAXPATHLEN) {
+	    fprintf(stderr, "%s: path too long: '%s'\n", pn, data);
+	    goto out;
+	}
+
+	if (DescribeEntry(path, verbose, 0) != 0) {
+	    goto out;
+	}
+	strcpy(last, path);
+    }
+
+    if (strcmp(path, "/") != 0 && strcmp(path, last) != 0 &&
+	DescribeEntry(path, verbose, 0) != 0) {
+	goto out;
+    }
+
+    code = 0;
+
+out:
+    free(path);
+    free(rest);
+    free(last);
+    free(cwd);
+
+    return code;
+}
+
+static int
+PathInfoCmd(struct cmd_syndesc *as, void *arock)
+{
+    struct cmd_item *ti;
+    int error = 0;
+    int multi;
+    int verbose;
+    int idx = 0;
+
+    SetDotDefault(&as->parms[0].items);
+    multi = (as->parms[0].items->next != NULL);
+    verbose = (as->parms[1].items != NULL);
+
+    for (ti = as->parms[0].items; ti; ti = ti->next) {
+	if (multi) {
+	    printf("===== Path %d =====\n\n", ++idx);
+	}
+
+	if (WalkPath(ti->data, verbose) != 0) {
+	    error = 1;
+	}
+
+	if (multi) {
+	    printf("\n");
+	}
+    }
+
+    return error;
+}
 
 static int
 ListMountCmd(struct cmd_syndesc *as, void *arock)
@@ -3569,6 +3852,12 @@ main(int argc, char **argv)
 
     ts = cmd_CreateSyntax("lsmount", ListMountCmd, NULL, 0, "list mount point");
     cmd_AddParm(ts, "-dir", CMD_LIST, 0, "directory");
+
+    ts = cmd_CreateSyntax("pathinfo", PathInfoCmd, NULL, 0,
+			  "display the type of each path component");
+    cmd_AddParm(ts, "-path", CMD_LIST, CMD_OPTIONAL, "dir/file path");
+    cmd_AddParm(ts, "-verbose", CMD_FLAG, CMD_OPTIONAL,
+		"describe a relative path from the root down");
 
     ts = cmd_CreateSyntax("mkmount", MakeMountCmd, NULL, 0, "make mount point");
     cmd_AddParm(ts, "-dir", CMD_SINGLE, 0, "directory");
